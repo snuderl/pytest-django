@@ -125,10 +125,52 @@ def django_db_setup(
             **setup_databases_args
         )
 
+
     def teardown_database() -> None:
         with django_db_blocker.unblock():
             try:
-                teardown_databases(db_cfg, verbosity=request.config.option.verbose)
+                if django_db_keepdb:
+                    # TODO: this would better belong in core django but that would require us to patch 2 libraries
+
+                    # When using Transactions django truncates table at the end of the test, and then next
+                    # test restores the snapshot (if using serialized_rollback). The issue however arises 
+                    # when we are also using --keep-db/reuse-db flag, since database is left empty at the end
+                    # and next test run does not know how to restore the db.
+                    # To account for that we restore db from snapshot once again at the end of the tests.
+
+                    verbosity = request.config.option.verbose
+                    parallel = 0
+                    for connection, old_name, destroy in db_cfg:
+                        if destroy:
+                            if parallel > 1:
+                                for index in range(parallel):
+                                    connection.creation.destroy_test_db(
+                                        suffix=str(index + 1),
+                                        verbosity=verbosity,
+                                        keepdb=True,
+                                    )
+                            connection.creation.destroy_test_db(old_name, verbosity, True)
+
+                            if  hasattr(connection, "_test_serialized_contents"):
+                                serialized_data = connection._test_serialized_contents
+                                old_settings = dict(connection.settings_dict)
+                                test_database_name = connection.creation._get_test_db_name()
+                                if parallel > 1:
+                                    for index in range(parallel):
+                                        connection.settings_dict["NAME"] = test_database_name
+                                        settings_dict = connection.creation.get_test_db_clone_settings(str(index + 1))
+                                        connection.settings_dict.update(settings_dict)
+                                        connection.close()
+                                        connection.creation.deserialize_db_from_string(serialized_data)
+                                else:
+                                    connection.settings_dict["NAME"] = test_database_name
+                                    connection.close()
+                                    connection.creation.deserialize_db_from_string(serialized_data)
+                                # Reset the connection settings
+                                connection.settings_dict.update(old_settings)
+                                connection.close()
+                else:
+                    teardown_databases(db_cfg, verbosity=request.config.option.verbose, keepdb=django_db_keepdb)
             except Exception as exc:
                 request.node.warn(
                     pytest.PytestWarning(
@@ -136,8 +178,7 @@ def django_db_setup(
                     )
                 )
 
-    if not django_db_keepdb:
-        request.addfinalizer(teardown_database)
+    request.addfinalizer(teardown_database)
 
 
 @pytest.fixture()
